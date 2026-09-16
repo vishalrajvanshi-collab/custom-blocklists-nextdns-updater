@@ -33,11 +33,27 @@ jobs:
         run: |
           set -euo pipefail
 
+          # ============================================================
+          # CONFIGURATION
+          # ============================================================
+
           LISTS_FILE="blocklists.txt"
+
+          # Upload tuning
+          CONCURRENCY=8
+          BATCH_SIZE=100
+
+          # Retry tuning
+          MAX_RETRIES=8
+          INITIAL_RETRY_DELAY=5
+          MAX_RETRY_DELAY=60
+
+          # ============================================================
+          # VALIDATE BLOCKLIST CONFIGURATION
+          # ============================================================
 
           if [ ! -f "$LISTS_FILE" ]; then
             echo "::error::Blocklists file not found: $LISTS_FILE"
-            echo "Create it with one blocklist URL per line."
             exit 1
           fi
 
@@ -48,24 +64,33 @@ jobs:
             exit 1
           fi
 
-          echo "Found $url_count blocklist URL(s) in $LISTS_FILE"
+          echo "Found $url_count blocklist URL(s)"
+
+          # ============================================================
+          # TEMPORARY FILES
+          # ============================================================
 
           TEMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TEMP_DIR"' EXIT
 
           COMBINED_RAW="$TEMP_DIR/blocklist_combined_raw.txt"
+          CLEAN_FILE="$TEMP_DIR/blocklist_clean.txt"
+
           touch "$COMBINED_RAW"
 
           # ============================================================
           # DOWNLOAD BLOCKLISTS
           # ============================================================
 
+          echo ""
+          echo "============================================================"
+          echo "Downloading blocklists"
+          echo "============================================================"
+
           url_index=1
 
           while IFS= read -r url || [ -n "$url" ]; do
-            url=$(echo "$url" \
-              | sed 's/[[:space:]]*$//' \
-              | sed 's/^[[:space:]]*//')
+            url=$(echo "$url" | sed 's/[[:space:]]*$//' | sed 's/^[[:space:]]*//')
 
             [ -z "$url" ] && continue
 
@@ -74,16 +99,17 @@ jobs:
             esac
 
             echo ""
-            echo "============================================================"
-            echo "Downloading blocklist $url_index / $url_count"
-            echo "$url"
-            echo "============================================================"
+            echo "Downloading list: $url"
 
-            if curl -sfL "$url" -o "$TEMP_DIR/source_$url_index.txt"; then
+            if curl -sfL --retry 3 --retry-delay 2 "$url" \
+              -o "$TEMP_DIR/source_$url_index.txt"; then
+
               lines=$(wc -l < "$TEMP_DIR/source_$url_index.txt")
-              echo "✓ Downloaded ($lines lines)"
+
+              echo "  ✓ Downloaded: $lines lines"
 
               cat "$TEMP_DIR/source_$url_index.txt" >> "$COMBINED_RAW"
+
             else
               echo "::error::Failed to download: $url"
               exit 1
@@ -98,24 +124,42 @@ jobs:
           echo "$(wc -l < "$COMBINED_RAW") total lines"
 
           # ============================================================
-          # CLEAN / NORMALIZE / DEDUPLICATE
+          # CLEAN + DEDUPLICATE
           # ============================================================
-
-          CLEAN_FILE="$TEMP_DIR/blocklist_clean.txt"
-
-          sed 's/#.*//' "$COMBINED_RAW" \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-            | grep -v '^$' \
-            | sort -u > "$CLEAN_FILE" || true
-
-          CLEAN_COUNT=$(wc -l < "$CLEAN_FILE")
 
           echo ""
           echo "============================================================"
           echo "Cleaning and deduplicating"
           echo "============================================================"
+
+          sed 's/#.*//' "$COMBINED_RAW" \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | grep -v '^$' \
+            | sort -u > "$CLEAN_FILE"
+
+          CLEAN_COUNT=$(wc -l < "$CLEAN_FILE")
+
           echo "✓ Normalized combined blocklist: $CLEAN_COUNT unique domains"
-          echo ""
+
+          TOTAL_SOURCE_DOMAINS="$CLEAN_COUNT"
+
+          # ============================================================
+          # FUNCTION: FORMAT SECONDS
+          # ============================================================
+
+          format_time() {
+            local total="$1"
+
+            local hours=$((total / 3600))
+            local minutes=$(((total % 3600) / 60))
+            local seconds=$((total % 60))
+
+            if [ "$hours" -gt 0 ]; then
+              printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
+            else
+              printf "%02d:%02d" "$minutes" "$seconds"
+            fi
+          }
 
           # ============================================================
           # ACCOUNT LOOP
@@ -130,6 +174,7 @@ jobs:
             api_key_value="${!secret_name:-}"
 
             if [ -z "$api_key_value" ]; then
+              echo ""
               echo "No more accounts found."
               break
             fi
@@ -142,7 +187,7 @@ jobs:
             export NEXTDNS_API_KEY="$api_key_value"
 
             # ==========================================================
-            # FIND PROFILES
+            # PROFILE DISCOVERY
             # ==========================================================
 
             echo "Fetching all profiles for account $account_num..."
@@ -162,7 +207,6 @@ jobs:
 
             echo "Found profiles:"
             echo "$profiles"
-            echo ""
 
             account_failed=0
 
@@ -175,115 +219,283 @@ jobs:
               echo ""
               echo "============================================================"
               echo "Profile: $profile"
-              echo "Total source domains: $CLEAN_COUNT"
+              echo "Total source domains: $TOTAL_SOURCE_DOMAINS"
               echo "============================================================"
 
               # ========================================================
-              # STEP 1 — EXPORT CURRENT DENYLIST
+              # EXPORT CURRENT DENYLIST
               # ========================================================
 
-              echo ""
               echo "Reading existing NextDNS denylist..."
+
+              CURRENT_FILE="$TEMP_DIR/current_${profile}.txt"
 
               if nextdnsctl denylist export "$profile" 2>/dev/null \
                 | sed 's/#.*//' \
                 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
                 | grep -v '^$' \
-                | sort -u > "$TEMP_DIR/current_${profile}.txt"
-              then
+                | sort -u > "$CURRENT_FILE"; then
 
-                CURRENT_COUNT=$(wc -l < "$TEMP_DIR/current_${profile}.txt")
+                EXISTING_COUNT=$(wc -l < "$CURRENT_FILE")
 
-                echo "Existing denylist entries detected: $CURRENT_COUNT"
-
-                # ======================================================
-                # FIND STALE ENTRIES
-                # ======================================================
-
-                STALE_FILE="$TEMP_DIR/stale_${profile}.txt"
-
-                comm -23 \
-                  "$TEMP_DIR/current_${profile}.txt" \
-                  "$CLEAN_FILE" \
-                  > "$STALE_FILE"
-
-                stale_count=$(wc -l < "$STALE_FILE")
-
-                if [ "$stale_count" -gt 0 ]; then
-
-                  echo ""
-                  echo "Found $stale_count stale domain(s) to remove"
-
-                  if xargs -r nextdnsctl denylist remove "$profile" \
-                    < "$STALE_FILE" 2>&1
-                  then
-                    echo "✓ Removed $stale_count stale domain(s)"
-                  else
-                    echo "::warning::Some stale domains may not have been removed for profile $profile"
-                  fi
-
-                else
-                  echo "No stale domains found"
-                fi
+                echo "Existing denylist entries detected: $EXISTING_COUNT"
 
               else
-
                 echo "::warning::Failed to export denylist for profile $profile"
-                echo "Skipping cleanup and continuing with import."
-
+                echo "Skipping stale cleanup."
+                EXISTING_COUNT=0
+                touch "$CURRENT_FILE"
               fi
 
               # ========================================================
-              # STEP 2 — IMPORT
-              #
-              # IMPORTANT:
-              # We intentionally do NOT force a custom concurrency value.
-              # nextdnsctl handles the API upload behavior itself.
+              # FIND STALE ENTRIES
               # ========================================================
+
+              STALE_FILE="$TEMP_DIR/stale_${profile}.txt"
+
+              comm -23 "$CURRENT_FILE" "$CLEAN_FILE" > "$STALE_FILE"
+
+              STALE_COUNT=$(wc -l < "$STALE_FILE")
+
+              if [ "$STALE_COUNT" -gt 0 ]; then
+
+                echo ""
+                echo "Found $STALE_COUNT stale domain(s) to remove"
+                echo "Removing stale domains..."
+
+                if xargs -r nextdnsctl denylist remove "$profile" \
+                  < "$STALE_FILE"; then
+
+                  echo "✓ Removed $STALE_COUNT stale domain(s)"
+
+                else
+                  echo "::warning::Some stale domains may not have been removed"
+                fi
+
+              else
+                echo "No stale domains found"
+              fi
+
+              # ========================================================
+              # CALCULATE NEW DOMAINS
+              # ========================================================
+
+              NEW_FILE="$TEMP_DIR/new_${profile}.txt"
+
+              comm -13 "$CURRENT_FILE" "$CLEAN_FILE" > "$NEW_FILE"
+
+              NEW_COUNT=$(wc -l < "$NEW_FILE")
 
               echo ""
               echo "============================================================"
-              echo "🚀 NextDNS upload"
+              echo "Denylist plan"
               echo "============================================================"
-              echo "Profile: $profile"
-              echo "Total unique source domains: $CLEAN_COUNT"
+              echo "Total source domains: $TOTAL_SOURCE_DOMAINS"
+              echo "Already present: $((TOTAL_SOURCE_DOMAINS - NEW_COUNT))"
+              echo "New domains to add: $NEW_COUNT"
+              echo "============================================================"
+
+              if [ "$NEW_COUNT" -eq 0 ]; then
+                echo "✓ Nothing new to upload."
+                continue
+              fi
+
+              # ========================================================
+              # UPLOAD
+              # ========================================================
+
               echo ""
-              echo "Starting nextdnsctl denylist import..."
-              echo "Progress will be reported by nextdnsctl."
+              echo "🚀 Starting NextDNS upload"
+              echo "Profile: $profile"
+              echo "New domains: $NEW_COUNT"
+              echo "Batch size: $BATCH_SIZE"
+              echo "Concurrency: $CONCURRENCY"
+              echo "Max retries: $MAX_RETRIES"
               echo ""
 
               START_TIME=$(date +%s)
 
-              if nextdnsctl denylist import \
-                "$profile" \
-                "$COMBINED_RAW" \
-                2>&1
-              then
+              # Split into manageable batches.
+              split -l "$BATCH_SIZE" -d -a 5 \
+                "$NEW_FILE" "$TEMP_DIR/batch_"
+
+              mapfile -t BATCH_FILES < <(
+                find "$TEMP_DIR" -maxdepth 1 -name 'batch_*' -type f | sort
+              )
+
+              TOTAL_BATCHES="${#BATCH_FILES[@]}"
+
+              echo "Total batches: $TOTAL_BATCHES"
+              echo ""
+
+              completed=0
+              failed_batches=0
+
+              # ========================================================
+              # BATCH PROCESSOR
+              # ========================================================
+
+              process_batch() {
+                local batch="$1"
+                local batch_num="$2"
+
+                local retry=0
+                local delay="$INITIAL_RETRY_DELAY"
+
+                while true; do
+
+                  # Run import directly.
+                  # No tail/head pipeline.
+                  if nextdnsctl denylist import \
+                    "$profile" \
+                    "$batch" \
+                    2>&1; then
+
+                    echo "BATCH_OK:$batch_num"
+                    return 0
+                  fi
+
+                  retry=$((retry + 1))
+
+                  if [ "$retry" -gt "$MAX_RETRIES" ]; then
+                    echo "BATCH_FAILED:$batch_num"
+                    return 1
+                  fi
+
+                  echo "Batch $batch_num rate/API failure."
+                  echo "Retry $retry/$MAX_RETRIES after ${delay}s..."
+
+                  sleep "$delay"
+
+                  delay=$((delay * 2))
+
+                  if [ "$delay" -gt "$MAX_RETRY_DELAY" ]; then
+                    delay="$MAX_RETRY_DELAY"
+                  fi
+
+                done
+              }
+
+              # ========================================================
+              # CONTROLLED CONCURRENCY
+              # ========================================================
+
+              batch_index=0
+
+              while [ "$batch_index" -lt "$TOTAL_BATCHES" ]; do
+
+                running=0
+                pids=()
+
+                while \
+                  [ "$batch_index" -lt "$TOTAL_BATCHES" ] &&
+                  [ "$running" -lt "$CONCURRENCY" ]; do
+
+                  batch_file="${BATCH_FILES[$batch_index]}"
+                  batch_num=$((batch_index + 1))
+
+                  process_batch "$batch_file" "$batch_num" &
+
+                  pids+=("$!")
+                  running=$((running + 1))
+                  batch_index=$((batch_index + 1))
+
+                done
+
+                for pid in "${pids[@]}"; do
+
+                  if wait "$pid"; then
+                    completed=$((completed + 1))
+                  else
+                    failed_batches=$((failed_batches + 1))
+                  fi
+
+                  NOW=$(date +%s)
+                  ELAPSED=$((NOW - START_TIME))
+
+                  if [ "$ELAPSED" -lt 1 ]; then
+                    ELAPSED=1
+                  fi
+
+                  # Each completed batch represents approximately
+                  # BATCH_SIZE domains, except the final batch.
+                  UPLOADED=$((completed * BATCH_SIZE))
+
+                  if [ "$UPLOADED" -gt "$NEW_COUNT" ]; then
+                    UPLOADED="$NEW_COUNT"
+                  fi
+
+                  REMAINING=$((NEW_COUNT - UPLOADED))
+
+                  RATE=$((UPLOADED / ELAPSED))
+
+                  if [ "$RATE" -gt 0 ]; then
+                    ETA=$((REMAINING / RATE))
+                  else
+                    ETA=0
+                  fi
+
+                  if [ "$NEW_COUNT" -gt 0 ]; then
+                    PROGRESS=$((UPLOADED * 100 / NEW_COUNT))
+                  else
+                    PROGRESS=100
+                  fi
+
+                  echo ""
+                  echo "🚀 NextDNS upload progress"
+                  echo "Profile: $profile"
+                  echo "Uploaded: $UPLOADED / $NEW_COUNT"
+                  echo "Remaining: $REMAINING"
+                  echo "Progress: ${PROGRESS}%"
+                  echo "Elapsed: $(format_time "$ELAPSED")"
+                  echo "Rate: ${RATE} domains/sec"
+                  echo "ETA: $(format_time "$ETA")"
+                  echo "Batches: $completed / $TOTAL_BATCHES"
+                  echo "Concurrency: $CONCURRENCY"
+                  echo ""
+
+                done
+
+              done
+
+              # ========================================================
+              # RESULT
+              # ========================================================
+
+              if [ "$failed_batches" -gt 0 ]; then
+
+                echo ""
+                echo "============================================================"
+                echo "✗ Upload completed with failures"
+                echo "============================================================"
+                echo "Successful batches: $completed"
+                echo "Failed batches: $failed_batches"
+                echo "============================================================"
+
+                account_failed=1
+                total_failed=1
+
+              else
 
                 END_TIME=$(date +%s)
                 ELAPSED=$((END_TIME - START_TIME))
 
-                HOURS=$((ELAPSED / 3600))
-                MINUTES=$(((ELAPSED % 3600) / 60))
-                SECONDS=$((ELAPSED % 60))
+                if [ "$ELAPSED" -lt 1 ]; then
+                  ELAPSED=1
+                fi
+
+                RATE=$((NEW_COUNT / ELAPSED))
 
                 echo ""
                 echo "============================================================"
-                echo "✅ NextDNS import completed"
+                echo "✅ NextDNS synchronization completed"
                 echo "============================================================"
                 echo "Profile: $profile"
-                echo "Source domains: $CLEAN_COUNT"
-                printf 'Elapsed: %02d:%02d:%02d\n' \
-                  "$HOURS" "$MINUTES" "$SECONDS"
+                echo "New domains uploaded: $NEW_COUNT"
+                echo "Elapsed: $(format_time "$ELAPSED")"
+                echo "Average rate: $RATE domains/sec"
+                echo "Concurrency: $CONCURRENCY"
                 echo "============================================================"
-
-              else
-
-                echo ""
-                echo "✗ Failed to import for profile: $profile"
-
-                account_failed=1
-                total_failed=1
 
               fi
 
@@ -315,7 +527,7 @@ jobs:
           echo "============================================================"
 
           if [ "$total_failed" -eq 1 ]; then
-            echo "::error::Some accounts had failures"
+            echo "::error::Some accounts or profiles had failures"
             exit 1
           fi
 

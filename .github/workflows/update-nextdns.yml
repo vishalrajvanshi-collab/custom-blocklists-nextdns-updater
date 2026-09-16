@@ -3,7 +3,7 @@ name: Update NextDNS Denylist
 on:
   schedule:
     - cron: '0 2 * * *' # Auto-updates every single day at 02:00 UTC
-  workflow_dispatch: # Allows you to manual-run anytime from GitHub Actions tab
+  workflow_dispatch: # Allows you to manually trigger it from the Actions tab anytime
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ jobs:
           COMBINED_RAW="combined_raw.txt"
           touch "$COMBINED_RAW"
 
-          # Automatically loop through any URLs you put inside blocklists.txt
+          # Loop through any blocklist URLs listed in blocklists.txt
           while IFS= read -r url || [ -n "$url" ]; do
             url=$(echo "$url" | xargs)
             [[ -z "$url" || "$url" =~ ^# ]] && continue
@@ -43,11 +43,11 @@ jobs:
             curl -sfL "$url" >> "$COMBINED_RAW" || echo "Warning: Failed to fetch $url"
           done < "$LISTS_FILE"
 
-          # Deduplicate, normalize, and strip out comments natively
+          # Deduplicate, normalize, and clean up formatting
           sed 's/#.*//' "$COMBINED_RAW" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | sort -u > final_blocklist.txt
           echo "Processed total unique domains: $(wc -l < final_blocklist.txt)"
 
-      - name: Dynamic Parallel Sync to NextDNS accounts
+      - name: Parallel Sync to NextDNS Profiles
         env:
           NEXTDNS_ACCOUNT_1_API_KEY: ${{ secrets.NEXTDNS_ACCOUNT_1_API_KEY }}
           NEXTDNS_ACCOUNT_2_API_KEY: ${{ secrets.NEXTDNS_ACCOUNT_2_API_KEY }}
@@ -55,6 +55,13 @@ jobs:
           NEXTDNS_ACCOUNT_4_API_KEY: ${{ secrets.NEXTDNS_ACCOUNT_4_API_KEY }}
           NEXTDNS_ACCOUNT_5_API_KEY: ${{ secrets.NEXTDNS_ACCOUNT_5_API_KEY }}
         run: |
+          # -------------------------------------------------------------
+          # FUTURE PROFILE PLACEHOLDER
+          # Add new 6-character profile IDs inside the parenthesis below,
+          # separated by spaces. Example: TARGET_PROFILES=("111a83" "222b94" "333c05")
+          # -------------------------------------------------------------
+          TARGET_PROFILES=("111a83")
+
           account_num=1
           while true; do
             secret_name="NEXTDNS_ACCOUNT_${account_num}_API_KEY"
@@ -68,15 +75,11 @@ jobs:
             echo "Syncing Account Index: $account_num"
             nextdnsctl auth "$api_key_value"
 
-            # Dynamic check: get your alphanumeric profile IDs matching the account
-            # (Fixes the hardcoded bug so it finds your active profiles automatically)
-            PROFILES=$(nextdnsctl profile-list | awk '{print $1}' | tail -n +2)
-
-            for profile in $PROFILES; do
+            # Loop through all profiles defined in the placeholder list above
+            for profile in "${TARGET_PROFILES[@]}"; do
               echo "Synchronizing profile: $profile"
               
-              # CRITICAL SPEED TWEAK: nextdnsctl uses parallel processing by default. 
-              # --update-existing ensures duplicate checking and prunes missing entries.
+              # Pushes the 17,000 domains using high-speed dynamic parallel syncing
               nextdnsctl denylist import "$profile" final_blocklist.txt --update-existing
             done
 

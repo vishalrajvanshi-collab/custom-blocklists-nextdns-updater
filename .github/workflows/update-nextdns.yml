@@ -106,7 +106,7 @@ jobs:
             export NEXTDNS_API_KEY="$api_key_value"
 
             echo "Fetching all profiles for account $account_num..."
-            profiles=$(nextdnsctl profile-list 2>/dev/null | grep -oP '^[a-z0-9]+(?=:)' | grep -v '^$')
+            profiles="111a83"
 
             if [ -z "$profiles" ]; then
               echo "::warning::No profiles found for account $account_num"

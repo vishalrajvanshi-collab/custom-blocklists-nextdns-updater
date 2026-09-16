@@ -1,85 +1,3 @@
-name: Update NextDNS Denylist
-
-on:
-  schedule:
-    - cron: '0 2 * * *' # Auto-updates every single day at 02:00 UTC
-  workflow_dispatch: # Allows manual triggering from the Actions tab
-
-permissions:
-  contents: read
-
-jobs:
-  update-denylist:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install nextdnsctl engine
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade nextdnsctl
-          echo "Installed nextdnsctl version:"
-          nextdnsctl --version
-
-      - name: Merge and Download Blocklists
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          LISTS_FILE="blocklists.txt"
-
-          if [ ! -f "$LISTS_FILE" ]; then
-            echo "::error::blocklists.txt file not found!"
-            exit 1
-          fi
-
-          COMBINED_RAW="combined_raw.txt"
-          FINAL_BLOCKLIST="final_blocklist.txt"
-
-          : > "$COMBINED_RAW"
-
-          # Loop through any blocklist URLs listed in blocklists.txt
-          while IFS= read -r url || [ -n "$url" ]; do
-            # Trim leading/trailing whitespace
-            url="$(echo "$url" | xargs)"
-
-            # Skip blank lines and comments
-            [[ -z "$url" || "$url" =~ ^# ]] && continue
-
-            echo "Downloading list: $url"
-
-            if ! curl --fail --silent --show-error --location \
-              --retry 3 \
-              --retry-delay 2 \
-              --connect-timeout 20 \
-              --max-time 300 \
-              "$url" >> "$COMBINED_RAW"; then
-              echo "::warning::Failed to fetch $url"
-            fi
-          done < "$LISTS_FILE"
-
-          # Deduplicate, normalize, and clean formatting
-          sed 's/#.*//' "$COMBINED_RAW" \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-            | grep -v '^$' \
-            | sort -u > "$FINAL_BLOCKLIST"
-
-          TOTAL_DOMAINS="$(wc -l < "$FINAL_BLOCKLIST" | tr -d ' ')"
-
-          echo "Processed total unique domains: $TOTAL_DOMAINS"
-
-          if [ "$TOTAL_DOMAINS" -eq 0 ]; then
-            echo "::error::The final blocklist is empty. Refusing to modify NextDNS."
-            exit 1
-          fi
-
       - name: Sync to NextDNS Profiles
         shell: bash
         env:
@@ -91,26 +9,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # -------------------------------------------------------------
-          # FUTURE PROFILE PLACEHOLDER
-          #
-          # Add new 6-character profile IDs inside the parenthesis below,
-          # separated by spaces.
-          #
-          # Example:
-          # TARGET_PROFILES=("111a83" "222b94" "333c05")
-          # -------------------------------------------------------------
           TARGET_PROFILES=("111a83")
 
-          # -------------------------------------------------------------
-          # Import tuning
-          #
-          # The script first checks whether the installed nextdnsctl
-          # supports these optional tuning arguments.
-          #
-          # If supported, they are used.
-          # If not supported, the normal importer is used automatically.
-          # -------------------------------------------------------------
           NEXTDNS_CONCURRENCY=8
           NEXTDNS_RETRY_ATTEMPTS=10
           NEXTDNS_RETRY_DELAY=2
@@ -165,30 +65,77 @@ jobs:
               echo "------------------------------------------------------------"
               echo "Synchronizing profile: $profile"
               echo "Domains in source list: $TOTAL_DOMAINS"
+              echo "Concurrency: $NEXTDNS_CONCURRENCY"
               echo "------------------------------------------------------------"
 
-              # Preserve the original import behavior:
-              # --update-existing remains enabled.
-              #
-              # Optional performance/retry arguments are added only
-              # when the installed nextdnsctl supports them.
+              # Start timer
+              START_TIME=$(date +%s)
+
+              # ---------------------------------------------------------
+              # Run nextdnsctl in the background.
+              # The importer remains responsible for the real upload.
+              # ---------------------------------------------------------
               nextdnsctl \
                 "${IMPORT_ARGS[@]}" \
                 denylist import \
                 "$profile" \
                 final_blocklist.txt \
-                --update-existing
+                --update-existing &
+              
+              IMPORT_PID=$!
 
-              echo "Successfully synchronized profile: $profile"
+              # ---------------------------------------------------------
+              # Live status ticker.
+              #
+              # This does NOT invent an uploaded-domain count.
+              # It only reports elapsed time and the known workload.
+              # ---------------------------------------------------------
+              while kill -0 "$IMPORT_PID" 2>/dev/null; do
+                NOW=$(date +%s)
+                ELAPSED=$((NOW - START_TIME))
+
+                HOURS=$((ELAPSED / 3600))
+                MINUTES=$(((ELAPSED % 3600) / 60))
+                SECONDS=$((ELAPSED % 60))
+
+                printf '\r⏱ NextDNS upload running | Profile: %s | Total domains: %s | Elapsed: %02d:%02d:%02d | Concurrency: %s' \
+                  "$profile" \
+                  "$TOTAL_DOMAINS" \
+                  "$HOURS" \
+                  "$MINUTES" \
+                  "$SECONDS" \
+                  "$NEXTDNS_CONCURRENCY"
+
+                sleep 5
+              done
+
+              # Get the actual exit status from nextdnsctl
+              wait "$IMPORT_PID"
+              IMPORT_STATUS=$?
+
+              END_TIME=$(date +%s)
+              TOTAL_TIME=$((END_TIME - START_TIME))
+
+              HOURS=$((TOTAL_TIME / 3600))
+              MINUTES=$(((TOTAL_TIME % 3600) / 60))
+              SECONDS=$((TOTAL_TIME % 60))
+
+              echo ""
+              echo "------------------------------------------------------------"
+
+              if [ "$IMPORT_STATUS" -eq 0 ]; then
+                echo "✅ NextDNS synchronization completed successfully"
+                echo "📦 Domains processed: $TOTAL_DOMAINS"
+                echo "⏱ Total elapsed time: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+                echo "🚀 Concurrency: $NEXTDNS_CONCURRENCY"
+              else
+                echo "::error::NextDNS synchronization failed with exit code $IMPORT_STATUS"
+                echo "⏱ Elapsed time: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+                exit "$IMPORT_STATUS"
+              fi
+
+              echo "------------------------------------------------------------"
             done
 
             account_num=$((account_num + 1))
           done
-
-      - name: Cleanup temporary files
-        if: always()
-        shell: bash
-        run: |
-          rm -f combined_raw.txt
-          rm -f final_blocklist.txt
-          echo "Temporary blocklist files removed."

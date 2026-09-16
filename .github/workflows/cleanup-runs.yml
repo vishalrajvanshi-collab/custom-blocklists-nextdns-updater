@@ -1,0 +1,78 @@
+name: Cleanup old NextDNS Denylist runs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Cleanup old workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          REPO="${{ github.repository }}"
+
+          cleanup_workflow() {
+            WORKFLOW_NAME="$1"
+
+            echo ""
+            echo "========================================"
+            echo "Cleaning: ${WORKFLOW_NAME}"
+            echo "========================================"
+
+            WORKFLOW_ID=$(gh api \
+              --paginate \
+              "/repos/${REPO}/actions/workflows" \
+              --jq ".workflows[] | select(.name == \"${WORKFLOW_NAME}\") | .id" |
+              head -n 1)
+
+            if [ -z "$WORKFLOW_ID" ]; then
+              echo "ERROR: Workflow not found: ${WORKFLOW_NAME}"
+              return 1
+            fi
+
+            echo "Workflow ID: ${WORKFLOW_ID}"
+            echo "Keeping newest 1 run."
+
+            RUN_IDS=$(gh api \
+              --paginate \
+              "/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
+              --jq '.workflow_runs[].id' |
+              tail -n +2)
+
+            if [ -z "$RUN_IDS" ]; then
+              echo "Nothing to delete."
+              return 0
+            fi
+
+            echo "$RUN_IDS" |
+            xargs -P 10 -n 1 sh -c '
+              RUN_ID="$1"
+
+              echo "Deleting run ${RUN_ID}..."
+
+              gh api \
+                --method DELETE \
+                "/repos/'"${REPO}"'/actions/runs/${RUN_ID}" \
+                >/dev/null || true
+            ' _
+
+            echo "Finished cleaning ${WORKFLOW_NAME}."
+          }
+
+          cleanup_workflow "Update NextDNS Denylist"
+          cleanup_workflow "Cleanup old NextDNS Denylist runs"
+
+          echo ""
+          echo "========================================"
+          echo "Cleanup complete."
+          echo "========================================"

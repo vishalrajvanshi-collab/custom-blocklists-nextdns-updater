@@ -2,8 +2,8 @@ name: Update NextDNS Denylist
 
 on:
   schedule:
-    - cron: '0 2 * * *' # Auto-updates every day at 02:00 UTC
-  workflow_dispatch: # Manual trigger from Actions
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,80 +13,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install nextdnsctl engine
-        run: |
-          python -m pip install --upgrade pip
-          pip install nextdnsctl
-          nextdnsctl --version
+      - name: Install nextdnsctl
+        run: pip install nextdnsctl
 
-      - name: Merge and Download Blocklists
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          LISTS_FILE="blocklists.txt"
-
-          if [ ! -f "$LISTS_FILE" ]; then
-            echo "::error::blocklists.txt file not found!"
-            exit 1
-          fi
-
-          COMBINED_RAW="combined_raw.txt"
-          FINAL_BLOCKLIST="final_blocklist.txt"
-
-          rm -f "$COMBINED_RAW" "$FINAL_BLOCKLIST"
-          touch "$COMBINED_RAW"
-
-          echo "============================================================"
-          echo "Downloading blocklists"
-          echo "============================================================"
-
-          while IFS= read -r url || [ -n "$url" ]; do
-            url="$(echo "$url" | xargs)"
-
-            [[ -z "$url" ]] && continue
-            [[ "$url" =~ ^# ]] && continue
-
-            echo "Downloading list: $url"
-
-            if ! curl -fL --retry 3 --retry-delay 2 \
-              --connect-timeout 20 \
-              --max-time 300 \
-              "$url" >> "$COMBINED_RAW"; then
-              echo "::warning::Failed to fetch $url"
-            fi
-
-          done < "$LISTS_FILE"
-
-          echo "============================================================"
-          echo "Cleaning and deduplicating"
-          echo "============================================================"
-
-          sed 's/#.*//' "$COMBINED_RAW" \
-            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-            | grep -v '^$' \
-            | sort -u \
-            > "$FINAL_BLOCKLIST"
-
-          TOTAL_DOMAINS="$(wc -l < "$FINAL_BLOCKLIST")"
-
-          echo "Total unique domains: $TOTAL_DOMAINS"
-
-          if [ "$TOTAL_DOMAINS" -eq 0 ]; then
-            echo "::error::No domains were found!"
-            exit 1
-          fi
-
-      - name: Sync to NextDNS Profiles
-        shell: bash
+      - name: Update denylist for all accounts
         env:
           NEXTDNS_ACCOUNT_1_API_KEY: ${{ secrets.NEXTDNS_ACCOUNT_1_API_KEY }}
           NEXTDNS_ACCOUNT_2_API_KEY: ${{ secrets.NEXTDNS_ACCOUNT_2_API_KEY }}
@@ -96,41 +33,88 @@ jobs:
         run: |
           set -euo pipefail
 
+          LISTS_FILE="blocklists.txt"
+
+          if [ ! -f "$LISTS_FILE" ]; then
+            echo "::error::Blocklists file not found: $LISTS_FILE"
+            echo "Create it with one blocklist URL per line."
+            exit 1
+          fi
+
+          url_count=$(grep -cv '^\s*$\|^\s*#' "$LISTS_FILE" || true)
+
+          if [ "$url_count" -eq 0 ]; then
+            echo "::error::No URLs found in $LISTS_FILE"
+            exit 1
+          fi
+
+          echo "Found $url_count blocklist URL(s) in $LISTS_FILE"
+
+          TEMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEMP_DIR"' EXIT
+
+          COMBINED_RAW="$TEMP_DIR/blocklist_combined_raw.txt"
+          touch "$COMBINED_RAW"
+
           # ============================================================
-          # CONFIGURATION
+          # DOWNLOAD BLOCKLISTS
           # ============================================================
 
-          # Add additional profile IDs here when needed.
-          TARGET_PROFILES=("111a83")
+          url_index=1
 
-          # Conservative concurrency to avoid NextDNS API rate limiting.
-          CONCURRENCY=4
+          while IFS= read -r url || [ -n "$url" ]; do
+            url=$(echo "$url" \
+              | sed 's/[[:space:]]*$//' \
+              | sed 's/^[[:space:]]*//')
 
-          # Number of domains handled per upload batch.
-          BATCH_SIZE=100
+            [ -z "$url" ] && continue
 
-          # Retry configuration.
-          RETRY_ATTEMPTS=10
-          RETRY_DELAY=5
+            case "$url" in
+              \#*) continue ;;
+            esac
+
+            echo ""
+            echo "============================================================"
+            echo "Downloading blocklist $url_index / $url_count"
+            echo "$url"
+            echo "============================================================"
+
+            if curl -sfL "$url" -o "$TEMP_DIR/source_$url_index.txt"; then
+              lines=$(wc -l < "$TEMP_DIR/source_$url_index.txt")
+              echo "✓ Downloaded ($lines lines)"
+
+              cat "$TEMP_DIR/source_$url_index.txt" >> "$COMBINED_RAW"
+            else
+              echo "::error::Failed to download: $url"
+              exit 1
+            fi
+
+            url_index=$((url_index + 1))
+
+          done < "$LISTS_FILE"
+
+          echo ""
+          echo "Combined raw blocklist:"
+          echo "$(wc -l < "$COMBINED_RAW") total lines"
 
           # ============================================================
-          # PREPARATION
+          # CLEAN / NORMALIZE / DEDUPLICATE
           # ============================================================
 
-          FINAL_BLOCKLIST="final_blocklist.txt"
+          CLEAN_FILE="$TEMP_DIR/blocklist_clean.txt"
 
-          TOTAL_DOMAINS="$(wc -l < "$FINAL_BLOCKLIST")"
+          sed 's/#.*//' "$COMBINED_RAW" \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | grep -v '^$' \
+            | sort -u > "$CLEAN_FILE" || true
+
+          CLEAN_COUNT=$(wc -l < "$CLEAN_FILE")
 
           echo ""
           echo "============================================================"
-          echo "NextDNS synchronization configuration"
+          echo "Cleaning and deduplicating"
           echo "============================================================"
-          echo "Total unique domains: $TOTAL_DOMAINS"
-          echo "Concurrency: $CONCURRENCY"
-          echo "Retry attempts: $RETRY_ATTEMPTS"
-          echo "Retry delay: ${RETRY_DELAY}s"
-          echo "Batch size: $BATCH_SIZE"
-          echo "============================================================"
+          echo "✓ Normalized combined blocklist: $CLEAN_COUNT unique domains"
           echo ""
 
           # ============================================================
@@ -138,111 +122,201 @@ jobs:
           # ============================================================
 
           account_num=1
+          total_failed=0
 
           while true; do
+
             secret_name="NEXTDNS_ACCOUNT_${account_num}_API_KEY"
             api_key_value="${!secret_name:-}"
 
             if [ -z "$api_key_value" ]; then
-              echo "Finished checking all configured accounts."
+              echo "No more accounts found."
               break
             fi
 
             echo ""
             echo "============================================================"
-            echo "Syncing Account Index: $account_num"
+            echo "Processing Account Index: $account_num"
             echo "============================================================"
 
-            nextdnsctl auth "$api_key_value"
+            export NEXTDNS_API_KEY="$api_key_value"
+
+            # ==========================================================
+            # FIND PROFILES
+            # ==========================================================
+
+            echo "Fetching all profiles for account $account_num..."
+
+            profiles=$(
+              nextdnsctl profile-list 2>/dev/null \
+                | grep -oP '^[a-z0-9]+(?=:)' \
+                | grep -v '^$' \
+                || true
+            )
+
+            if [ -z "$profiles" ]; then
+              echo "::warning::No profiles found for account $account_num"
+              account_num=$((account_num + 1))
+              continue
+            fi
+
+            echo "Found profiles:"
+            echo "$profiles"
+            echo ""
+
+            account_failed=0
 
             # ==========================================================
             # PROFILE LOOP
             # ==========================================================
 
-            for profile in "${TARGET_PROFILES[@]}"; do
+            for profile in $profiles; do
 
               echo ""
-              echo "------------------------------------------------------------"
-              echo "Synchronizing profile: $profile"
-              echo "Domains in source list: $TOTAL_DOMAINS"
-              echo "------------------------------------------------------------"
-
-              # --------------------------------------------------------
-              # IMPORTANT:
-              # First perform the normal nextdnsctl synchronization.
-              #
-              # This preserves the original behavior:
-              #   --update-existing
-              #
-              # We do NOT use tail/head pipelines for progress tracking.
-              # --------------------------------------------------------
-
-              START_TIME="$(date +%s)"
-
-              echo ""
-              echo "🚀 NextDNS upload"
+              echo "============================================================"
               echo "Profile: $profile"
-              echo "Total domains: $TOTAL_DOMAINS"
-              echo "Concurrency: $CONCURRENCY"
+              echo "Total source domains: $CLEAN_COUNT"
+              echo "============================================================"
+
+              # ========================================================
+              # STEP 1 — EXPORT CURRENT DENYLIST
+              # ========================================================
+
+              echo ""
+              echo "Reading existing NextDNS denylist..."
+
+              if nextdnsctl denylist export "$profile" 2>/dev/null \
+                | sed 's/#.*//' \
+                | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                | grep -v '^$' \
+                | sort -u > "$TEMP_DIR/current_${profile}.txt"
+              then
+
+                CURRENT_COUNT=$(wc -l < "$TEMP_DIR/current_${profile}.txt")
+
+                echo "Existing denylist entries detected: $CURRENT_COUNT"
+
+                # ======================================================
+                # FIND STALE ENTRIES
+                # ======================================================
+
+                STALE_FILE="$TEMP_DIR/stale_${profile}.txt"
+
+                comm -23 \
+                  "$TEMP_DIR/current_${profile}.txt" \
+                  "$CLEAN_FILE" \
+                  > "$STALE_FILE"
+
+                stale_count=$(wc -l < "$STALE_FILE")
+
+                if [ "$stale_count" -gt 0 ]; then
+
+                  echo ""
+                  echo "Found $stale_count stale domain(s) to remove"
+
+                  if xargs -r nextdnsctl denylist remove "$profile" \
+                    < "$STALE_FILE" 2>&1
+                  then
+                    echo "✓ Removed $stale_count stale domain(s)"
+                  else
+                    echo "::warning::Some stale domains may not have been removed for profile $profile"
+                  fi
+
+                else
+                  echo "No stale domains found"
+                fi
+
+              else
+
+                echo "::warning::Failed to export denylist for profile $profile"
+                echo "Skipping cleanup and continuing with import."
+
+              fi
+
+              # ========================================================
+              # STEP 2 — IMPORT
+              #
+              # IMPORTANT:
+              # We intentionally do NOT force a custom concurrency value.
+              # nextdnsctl handles the API upload behavior itself.
+              # ========================================================
+
+              echo ""
+              echo "============================================================"
+              echo "🚀 NextDNS upload"
+              echo "============================================================"
+              echo "Profile: $profile"
+              echo "Total unique source domains: $CLEAN_COUNT"
+              echo ""
+              echo "Starting nextdnsctl denylist import..."
+              echo "Progress will be reported by nextdnsctl."
               echo ""
 
-              # --------------------------------------------------------
-              # Run nextdnsctl directly.
-              #
-              # Do not pipe its output through tail.
-              # This prevents the Broken pipe error.
-              # --------------------------------------------------------
+              START_TIME=$(date +%s)
 
               if nextdnsctl denylist import \
                 "$profile" \
-                "$FINAL_BLOCKLIST" \
-                --update-existing; then
+                "$COMBINED_RAW" \
+                2>&1
+              then
 
-                END_TIME="$(date +%s)"
+                END_TIME=$(date +%s)
                 ELAPSED=$((END_TIME - START_TIME))
 
-                if [ "$ELAPSED" -lt 1 ]; then
-                  ELAPSED=1
-                fi
+                HOURS=$((ELAPSED / 3600))
+                MINUTES=$(((ELAPSED % 3600) / 60))
+                SECONDS=$((ELAPSED % 60))
 
-                RATE=$((TOTAL_DOMAINS / ELAPSED))
-
-                if [ "$RATE" -gt 0 ]; then
-                  REMAINING_SECONDS=$((TOTAL_DOMAINS / RATE))
-                else
-                  REMAINING_SECONDS=0
-                fi
-
-                HOURS=$((REMAINING_SECONDS / 3600))
-                MINUTES=$(((REMAINING_SECONDS % 3600) / 60))
-                SECONDS=$((REMAINING_SECONDS % 60))
-
-                printf '\n'
+                echo ""
                 echo "============================================================"
-                echo "✅ NextDNS synchronization completed"
+                echo "✅ NextDNS import completed"
                 echo "============================================================"
                 echo "Profile: $profile"
-                echo "Domains processed: $TOTAL_DOMAINS"
-                echo "Elapsed: ${ELAPSED}s"
-                echo "Average rate: ${RATE} domains/sec"
-                printf '============================================================\n'
-                echo ""
+                echo "Source domains: $CLEAN_COUNT"
+                printf 'Elapsed: %02d:%02d:%02d\n' \
+                  "$HOURS" "$MINUTES" "$SECONDS"
+                echo "============================================================"
 
               else
+
                 echo ""
-                echo "::error::NextDNS synchronization failed for profile $profile"
-                exit 1
+                echo "✗ Failed to import for profile: $profile"
+
+                account_failed=1
+                total_failed=1
+
               fi
+
+              echo ""
 
             done
 
+            # ==========================================================
+            # ACCOUNT RESULT
+            # ==========================================================
+
+            if [ "$account_failed" -eq 0 ]; then
+              echo "✓ All profiles updated successfully for account $account_num!"
+            else
+              echo "✗ Some profiles failed for account $account_num"
+            fi
+
             account_num=$((account_num + 1))
+
           done
 
-      - name: Cleanup temporary files
-        if: always()
-        shell: bash
-        run: |
-          rm -f combined_raw.txt
-          rm -f final_blocklist.txt
-          echo "Temporary blocklist files removed."
+          # ============================================================
+          # FINAL RESULT
+          # ============================================================
+
+          echo ""
+          echo "============================================================"
+          echo "Update cycle complete"
+          echo "============================================================"
+
+          if [ "$total_failed" -eq 1 ]; then
+            echo "::error::Some accounts had failures"
+            exit 1
+          fi
+
+          echo "✓ All accounts processed successfully!"

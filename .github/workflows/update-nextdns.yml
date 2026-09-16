@@ -68,7 +68,10 @@ jobs:
           url_index=1
 
           while IFS= read -r url || [ -n "$url" ]; do
-            url=$(echo "$url" | sed 's/[[:space:]]*$//' | sed 's/^[[:space:]]*//')
+
+            url=$(echo "$url" \
+              | sed 's/[[:space:]]*$//' \
+              | sed 's/^[[:space:]]*//')
 
             [ -z "$url" ] && continue
 
@@ -199,7 +202,7 @@ jobs:
               echo "Existing denylist entries detected: $EXISTING_COUNT"
 
               # ========================================================
-              # FIND STALE + MISSING
+              # CALCULATE DELTAS
               # ========================================================
 
               comm -23 "$CURRENT_FILE" "$CLEAN_FILE" > "$STALE_FILE"
@@ -222,6 +225,7 @@ jobs:
                 else
 
                   echo "::warning::Some stale domains may not have been removed"
+
                 fi
 
               else
@@ -229,10 +233,6 @@ jobs:
                 echo "No stale domains found"
 
               fi
-
-              # ========================================================
-              # UPLOAD ONLY MISSING DOMAINS
-              # ========================================================
 
               echo ""
               echo "============================================================"
@@ -248,43 +248,162 @@ jobs:
                 continue
               fi
 
+              # ========================================================
+              # SINGLE FAST IMPORT
+              # ========================================================
+
               echo ""
+              echo "============================================================"
               echo "🚀 Starting NextDNS upload"
+              echo "============================================================"
               echo "Profile: $profile"
               echo "New domains: $MISSING_COUNT"
+              echo "Mode: Single import"
               echo "============================================================"
 
               START_TIME=$(date +%s)
 
-              # IMPORTANT:
-              # One import instead of dozens/hundreds of small imports.
-              #
-              # nextdnsctl itself handles the API operations and
-              # rate limiting. We do not pipe its output through tail,
-              # head, or other commands.
+              UPLOAD_LOG="$TEMP_DIR/upload_${profile}.log"
 
-              if nextdnsctl denylist import \
+              # --------------------------------------------------------
+              # Start import in background.
+              # --------------------------------------------------------
+
+              set +e
+
+              nextdnsctl denylist import \
                 "$profile" \
                 "$MISSING_FILE" \
-                2>&1; then
+                > "$UPLOAD_LOG" 2>&1 &
 
-                END_TIME=$(date +%s)
-                ELAPSED=$((END_TIME - START_TIME))
+              UPLOAD_PID=$!
 
-                if [ "$ELAPSED" -lt 1 ]; then
-                  ELAPSED=1
+              set -e
+
+              # ========================================================
+              # LIVE PROGRESS MONITOR
+              # ========================================================
+
+              LAST_COUNT=0
+              LAST_TIME="$START_TIME"
+
+              echo ""
+              echo "📊 Live progress monitor started"
+              echo ""
+
+              while kill -0 "$UPLOAD_PID" 2>/dev/null; do
+
+                sleep 30
+
+                NOW=$(date +%s)
+                ELAPSED=$((NOW - START_TIME))
+
+                # Export current denylist to measure progress.
+                # Failure here does NOT stop the upload.
+
+                MONITOR_FILE="$TEMP_DIR/monitor_${profile}.txt"
+
+                if nextdnsctl denylist export "$profile" 2>/dev/null \
+                  | sed 's/#.*//' \
+                  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                  | grep -v '^$' \
+                  | sort -u > "$MONITOR_FILE"; then
+
+                  CURRENT_TOTAL=$(wc -l < "$MONITOR_FILE")
+
+                  # Progress is measured against the original missing set.
+                  CURRENT_ADDED=$(comm -12 \
+                    "$MISSING_FILE" \
+                    "$MONITOR_FILE" \
+                    | wc -l)
+
+                  if [ "$CURRENT_ADDED" -gt "$MISSING_COUNT" ]; then
+                    CURRENT_ADDED="$MISSING_COUNT"
+                  fi
+
+                  REMAINING=$((MISSING_COUNT - CURRENT_ADDED))
+
+                  if [ "$ELAPSED" -gt 0 ]; then
+                    RATE=$((CURRENT_ADDED / ELAPSED))
+                  else
+                    RATE=0
+                  fi
+
+                  if [ "$RATE" -gt 0 ]; then
+                    ETA_SECONDS=$((REMAINING / RATE))
+                  else
+                    ETA_SECONDS=0
+                  fi
+
+                  HOURS=$((ETA_SECONDS / 3600))
+                  MINUTES=$(((ETA_SECONDS % 3600) / 60))
+                  SECONDS=$((ETA_SECONDS % 60))
+
+                  if [ "$MISSING_COUNT" -gt 0 ]; then
+                    PERCENT=$((CURRENT_ADDED * 100 / MISSING_COUNT))
+                  else
+                    PERCENT=100
+                  fi
+
+                  echo ""
+                  echo "------------------------------------------------------------"
+                  echo "📊 NextDNS upload progress"
+                  echo "Profile: $profile"
+                  echo "Uploaded: $CURRENT_ADDED / $MISSING_COUNT"
+                  echo "Remaining: $REMAINING"
+                  echo "Progress: ${PERCENT}%"
+                  echo "Elapsed: ${ELAPSED}s"
+                  echo "Rate: ${RATE} domains/sec"
+                  printf 'ETA: %02d:%02d:%02d\n' \
+                    "$HOURS" "$MINUTES" "$SECONDS"
+                  echo "------------------------------------------------------------"
+
+                  LAST_COUNT="$CURRENT_ADDED"
+                  LAST_TIME="$NOW"
+
+                else
+
+                  echo "⏳ Upload still running... progress check unavailable."
+
                 fi
 
-                RATE=$((MISSING_COUNT / ELAPSED))
+              done
+
+              # ========================================================
+              # WAIT FOR IMPORT RESULT
+              # ========================================================
+
+              set +e
+              wait "$UPLOAD_PID"
+              UPLOAD_EXIT=$?
+              set -e
+
+              END_TIME=$(date +%s)
+              ELAPSED=$((END_TIME - START_TIME))
+
+              echo ""
+              echo "============================================================"
+              echo "NextDNS import finished"
+              echo "============================================================"
+
+              # Display actual nextdnsctl output.
+              cat "$UPLOAD_LOG"
+
+              if [ "$UPLOAD_EXIT" -eq 0 ]; then
 
                 echo ""
                 echo "============================================================"
                 echo "✅ NextDNS upload completed"
                 echo "============================================================"
                 echo "Profile: $profile"
-                echo "Uploaded: $MISSING_COUNT"
+                echo "Domains submitted: $MISSING_COUNT"
                 echo "Elapsed: ${ELAPSED}s"
-                echo "Average rate: ${RATE} domains/sec"
+
+                if [ "$ELAPSED" -gt 0 ]; then
+                  FINAL_RATE=$((MISSING_COUNT / ELAPSED))
+                  echo "Average rate: ${FINAL_RATE} domains/sec"
+                fi
+
                 echo "============================================================"
 
               else

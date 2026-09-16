@@ -2,3 +2,4 @@
 # Lines starting with # are ignored
 https://gitlab.com/bangobang/ytblk/-/raw/main/NextDNS-Denylist.txt?ref_type=heads
 https://raw.githubusercontent.com/kboghdady/youTube_ads_4_pi-hole/refs/heads/master/youtubelist.txt
+https://gitlab.com/bangobang/ytblk/-/raw/main/1.txt?ref_type=heads

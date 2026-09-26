@@ -1,0 +1,164 @@
+name: Cleanup workflow runs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Cleanup workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+
+          echo "========================================"
+          echo "Repository: $REPO"
+          echo "========================================"
+
+          # Get all currently existing workflows
+          gh api \
+            --paginate \
+            "/repos/${REPO}/actions/workflows" \
+            --jq '.workflows[] | "\(.id)|\(.path)|\(.name)"' \
+            > /tmp/current-workflows.txt
+
+          echo
+          echo "Current workflows:"
+          cat /tmp/current-workflows.txt
+
+          # ==================================================
+          # CURRENT WORKFLOWS
+          # Keep newest run, delete older completed runs
+          # ==================================================
+
+          while IFS='|' read -r WORKFLOW_ID WORKFLOW_PATH WORKFLOW_NAME; do
+
+            [ -z "$WORKFLOW_ID" ] && continue
+
+            echo
+            echo "========================================"
+            echo "Workflow: $WORKFLOW_NAME"
+            echo "Path: $WORKFLOW_PATH"
+            echo "ID: $WORKFLOW_ID"
+            echo "========================================"
+
+            RUNS=$(gh api \
+              --paginate \
+              "/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
+              --jq '.workflow_runs[] | "\(.id)|\(.status)|\(.created_at)"' |
+              sort -t'|' -k3,3r)
+
+            if [ -z "$RUNS" ]; then
+              echo "No runs found."
+              continue
+            fi
+
+            # Always keep the newest run
+            NEWEST_RUN_ID=$(echo "$RUNS" | head -n 1 | cut -d'|' -f1)
+
+            echo "Keeping newest run: $NEWEST_RUN_ID"
+
+            # Delete every older completed run
+            echo "$RUNS" |
+            tail -n +2 |
+            while IFS='|' read -r RUN_ID STATUS CREATED_AT; do
+
+              [ -z "$RUN_ID" ] && continue
+
+              # Never delete active runs
+              if [ "$STATUS" != "completed" ]; then
+                echo "Skipping active run: $RUN_ID ($STATUS)"
+                continue
+              fi
+
+              echo "Deleting old completed run: $RUN_ID"
+
+              if gh api \
+                --method DELETE \
+                "/repos/${REPO}/actions/runs/${RUN_ID}"; then
+
+                echo "Deleted: $RUN_ID"
+
+              else
+
+                echo "Could not delete: $RUN_ID"
+
+              fi
+
+            done
+
+          done < /tmp/current-workflows.txt
+
+          # ==================================================
+          # OBSOLETE WORKFLOWS
+          # Find runs whose workflow no longer exists
+          # ==================================================
+
+          echo
+          echo "========================================"
+          echo "Searching for obsolete workflow runs..."
+          echo "========================================"
+
+          CURRENT_IDS=$(cut -d'|' -f1 /tmp/current-workflows.txt)
+
+          gh api \
+            --paginate \
+            "/repos/${REPO}/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | "\(.id)|\(.workflow_id)|\(.status)|\(.created_at)|\(.name)"' |
+          while IFS='|' read -r RUN_ID WORKFLOW_ID STATUS CREATED_AT RUN_NAME; do
+
+            [ -z "$RUN_ID" ] && continue
+
+            # Workflow still exists, so it was already handled above
+            if echo "$CURRENT_IDS" | grep -Fxq "$WORKFLOW_ID"; then
+              continue
+            fi
+
+            echo
+            echo "Obsolete workflow run found:"
+            echo "Run:      $RUN_ID"
+            echo "Workflow: $WORKFLOW_ID"
+            echo "Name:     $RUN_NAME"
+            echo "Status:   $STATUS"
+            echo "Created:  $CREATED_AT"
+
+            # Never delete active runs
+            if [ "$STATUS" != "completed" ]; then
+              echo "Skipping active obsolete run."
+              continue
+            fi
+
+            echo "Deleting obsolete run: $RUN_ID"
+
+            if gh api \
+              --method DELETE \
+              "/repos/${REPO}/actions/runs/${RUN_ID}"; then
+
+              echo "Deleted obsolete run: $RUN_ID"
+
+            else
+
+              echo "Could not delete obsolete run: $RUN_ID"
+
+            fi
+
+          done
+
+          echo
+          echo "========================================"
+          echo "Cleanup complete."
+          echo "========================================"
+          echo "Newest run kept for every current workflow."
+          echo "Older completed runs deleted."
+          echo "Obsolete workflow runs deleted."
+          echo "Active runs left untouched."
